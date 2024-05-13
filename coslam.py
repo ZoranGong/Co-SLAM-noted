@@ -630,12 +630,28 @@ class CoSLAM():
                         mesh_savepath=mesh_savepath)      
         
     def run(self):
+        # ********************* 创建map和BA的优化器 *********************
+        # Adam 优化器，用于优化encoder/decoder网络
+        # 优化位姿的优化器见tracking_render()
         self.create_optimizer()
+
+        # ********************* 加载数据 *********************
         data_loader = DataLoader(self.dataset, num_workers=self.config['data']['num_workers'])
 
-        # Start Co-SLAM!
+        # *******************Start Co-SLAM!(tracking + Mapping)********************
+        """
+        tqdm类:给迭代过程显示进度条。
+        enumerate():同时获得可迭代对象的索引和对应元素,所以i是索引,batch是当前批次的数据。
+
+        batch: tum数据集
+            - frame_id: [i] 同索引i
+            - c2w:      [1,4,4]      
+            - rgb:      [1,368,496,3]
+            - depth:    [1,368,496]
+            - direction:[1,368,496,3]
+        """ 
         for i, batch in tqdm(enumerate(data_loader)):
-            # Visualisation
+            # ********************* 可视化rgb和深度图 *********************
             if self.config['mesh']['visualisation']:
                 rgb = cv2.cvtColor(batch["rgb"].squeeze().cpu().numpy(), cv2.COLOR_BGR2RGB)
                 raw_depth = batch["depth"]
@@ -648,33 +664,40 @@ class CoSLAM():
                 cv2.imshow('RGB-D'.format(i), image)
                 key = cv2.waitKey(1)
 
+            # ********************* 建立初始的 地图和位姿估计 *********************
             # First frame mapping
             if i == 0:
                 self.first_frame_mapping(batch, self.config['mapping']['first_iters'])
-            
+
+            # ********************* 建立每一帧的地图和位姿估计 *********************
             # Tracking + Mapping
             else:
+                 # ! -------------------- 2. tracking -------------------- 
                 if self.config['tracking']['iter_point'] > 0:
+                    # 通过点云损失来跟踪当前帧的相机位姿，本论文没用该方法
                     self.tracking_pc(batch, i)
+                # 使用当前帧的rgb损失，深度损失，sdf损失，fs损失来跟踪当前帧的相机位姿
                 self.tracking_render(batch, i)
-    
-                if i%self.config['mapping']['map_every']==0:
+
+                # ! -------------------- 3. Mapping -------------------- 
+                if i%self.config['mapping']['map_every']==0:    # 每5帧建一次图
                     self.current_frame_mapping(batch, i)
+                    # ! -------------------- 3.3 BA -------------------- 
                     self.global_BA(batch, i)
 
-                    
+                # ! -------------------- 3.1 Keyframe database -------------------- 
                 # Add keyframe
                 if i % self.config['mapping']['keyframe_every'] == 0:
                     self.keyframeDatabase.add_keyframe(batch, filter_depth=self.config['mapping']['filter_depth'])
                     print('add keyframe:',i)
             
-
+                # ! -------------------- * Evaluation -------------------- 
                 if i % self.config['mesh']['vis']==0:
                     self.save_mesh(i, voxel_size=self.config['mesh']['voxel_eval'])
                     pose_relative = self.convert_relative_pose()
                     pose_evaluation(self.pose_gt, self.est_c2w_data, 1, os.path.join(self.config['data']['output'], self.config['data']['exp_name']), i)
                     pose_evaluation(self.pose_gt, pose_relative, 1, os.path.join(self.config['data']['output'], self.config['data']['exp_name']), i, img='pose_r', name='output_relative.txt')
-
+                    # 展示轨迹真值和预测轨迹图
                     if cfg['mesh']['visualisation']:
                         cv2.namedWindow('Traj:'.format(i), cv2.WINDOW_AUTOSIZE)
                         traj_image = cv2.imread(os.path.join(self.config['data']['output'], self.config['data']['exp_name'], "pose_r_{}.png".format(i)))
@@ -698,6 +721,7 @@ class CoSLAM():
 
 if __name__ == '__main__':
             
+    # ********************* 加载参数 *********************
     print('Start running...')
     parser = argparse.ArgumentParser(
         description='Arguments for running the NICE-SLAM/iMAP*.'
@@ -723,6 +747,7 @@ if __name__ == '__main__':
     with open(os.path.join(save_path, 'config.json'),"w", encoding='utf-8') as f:
         f.write(json.dumps(cfg, indent=4))
 
+    # ********************* 开始SLAM *********************
     slam = CoSLAM(cfg)
 
     slam.run()
