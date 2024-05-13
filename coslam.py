@@ -31,11 +31,13 @@ class CoSLAM():
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dataset = get_dataset(config)
         
-        self.create_bounds()
-        self.create_pose_data()
-        self.get_pose_representation()
-        self.keyframeDatabase = self.create_kf_database(config)
-        self.model = JointEncoding(config, self.bounding_box).to(self.device)
+        self.create_bounds()                                                    # 建图的边界
+        self.create_pose_data()                                                 # 创建存储 估计的位姿 和 数据集中的位姿gt 到用的字典
+        self.get_pose_representation()                                          # 查看当前数据集是用轴角还是四元数表示的,tum数据集是轴角
+        self.keyframeDatabase = self.create_kf_database(config)                 # tum/fr1_desk: 每5帧取为一个关键帧
+        
+        # ! -------------------- 1. Scene representation -------------------- 
+        self.model = JointEncoding(config, self.bounding_box).to(self.device)    # 得到encoding/decoding网络，用于获得深度和颜色信息
     
     def seed_everything(self, seed):
         random.seed(seed)
@@ -127,7 +129,7 @@ class CoSLAM():
         randomly select samples from the image
         '''
         #indice = torch.randint(H*W, (samples,))
-        indice = random.sample(range(H * W), int(samples))
+        indice = random.sample(range(H * W), int(samples))            # 从一个范围内的整数（0 到 H * W - 1）中随机选择samples个整数索引
         indice = torch.tensor(indice)
         return indice
 
@@ -165,39 +167,48 @@ class CoSLAM():
             loss: float
         
         '''
+        # ********************* 读取第0帧的相机位姿 *********************
         print('First frame mapping...')
-        c2w = batch['c2w'][0].to(self.device)
-        self.est_c2w_data[0] = c2w
-        self.est_c2w_data_rel[0] = c2w
+        c2w = batch['c2w'][0].to(self.device)        # [4,4]
+        self.est_c2w_data[0] = c2w                   # 第0帧的观测位姿 直接作为 位姿估计
+        self.est_c2w_data_rel[0] = c2w               
 
-        self.model.train()
+        self.model.train()                           # 将模型设置为训练模式
 
-        # Training
+        # Training n_iters=100
         for i in range(n_iters):
-            self.map_optimizer.zero_grad()
-            indice = self.select_samples(self.dataset.H, self.dataset.W, self.config['mapping']['sample'])
+            # ********************* 获得第0帧每个像素的颜色，深度，方向 *********************
+            self.map_optimizer.zero_grad()            # 将之前的梯度信息清零
+            indice = self.select_samples(self.dataset.H, self.dataset.W, self.config['mapping']['sample'])    # 从一个范围内的整数（0 到 H * W - 1）中随机选择samples=2048个样本像素
             
-            indice_h, indice_w = indice % (self.dataset.H), indice // (self.dataset.H)
-            rays_d_cam = batch['direction'].squeeze(0)[indice_h, indice_w, :].to(self.device)
-            target_s = batch['rgb'].squeeze(0)[indice_h, indice_w, :].to(self.device)
-            target_d = batch['depth'].squeeze(0)[indice_h, indice_w].to(self.device).unsqueeze(-1)
+            indice_h, indice_w = indice % (self.dataset.H), indice // (self.dataset.H)                 # 得到每个采样得到的像素的h,w值             [2048]
+            rays_d_cam = batch['direction'].squeeze(0)[indice_h, indice_w, :].to(self.device)          # 得到每个样本像素的方向，作为目标射线方向    [2048,3]
+            target_s = batch['rgb'].squeeze(0)[indice_h, indice_w, :].to(self.device)                  # 得到每个样本像素的颜色，作为目标颜色        [2048.3]
+            target_d = batch['depth'].squeeze(0)[indice_h, indice_w].to(self.device).unsqueeze(-1)     # 得到每个样本像素的深度，作为目标深度        [2048,1]
 
-            rays_o = c2w[None, :3, -1].repeat(self.config['mapping']['sample'], 1)
-            rays_d = torch.sum(rays_d_cam[..., None, :] * c2w[:3, :3], -1)
+            rays_o = c2w[None, :3, -1].repeat(self.config['mapping']['sample'], 1)                     # 世界坐标系下的射线原点，即变换矩阵的t，即相机位置 [2048,3]
+            # rays_d_cam[..., None, :] 相机坐标系中的射线方向： [2048,1,3]
+            # c2w[:3, :3] : 旋转矩阵    [3,3]
+            # sum(x,-1) 在最后一个维度上进行求和
+            rays_d = torch.sum(rays_d_cam[..., None, :] * c2w[:3, :3], -1)                             # 世界坐标系下的射线方向 [2048,3]                     
 
             # Forward
-            ret = self.model.forward(rays_o, rays_d, target_s, target_d)
-            loss = self.get_loss_from_ret(ret)
-            loss.backward()
-            self.map_optimizer.step()
+            # ********************* 前向传播: 得到rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 *********************
+            ret = self.model.forward(rays_o, rays_d, target_s, target_d)        # 前向传播
+            loss = self.get_loss_from_ret(ret)                                  # 将所有损失求和
+            
+            # ********************* 反响传播: 优化encoder/decoder网络的参数 *********************
+            loss.backward()                                                     # 反响传播
+            self.map_optimizer.step()                                           # 使用adam优化encoder和decoder网络的参数
         
+        # ********************* 将当前帧加入关键帧 *********************
         # First frame will always be a keyframe
         self.keyframeDatabase.add_keyframe(batch, filter_depth=self.config['mapping']['filter_depth'])
         if self.config['mapping']['first_mesh']:
             self.save_mesh(0)
         
         print('First frame mapping done')
-        return ret, loss
+        return ret, loss            # 返回: rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 
 
     def current_frame_mapping(self, batch, cur_frame_id):
         '''
@@ -215,14 +226,16 @@ class CoSLAM():
         if self.config['mapping']['cur_frame_iters'] <= 0:
             return
         print('Current frame mapping...')
-        
+
+        # ********************* 读取当前帧的位姿估计 *********************
         c2w = self.est_c2w_data[cur_frame_id].to(self.device)
 
-        self.model.train()
+        self.model.train()    # 将模型设置为训练模式
 
         # Training
         for i in range(self.config['mapping']['cur_frame_iters']):
-            self.cur_map_optimizer.zero_grad()
+            # ********************* 从数据集获得当前帧每个像素的颜色，深度，方向观测值 *********************
+            self.cur_map_optimizer.zero_grad()    # 将之前的梯度信息清零
             indice = self.select_samples(self.dataset.H, self.dataset.W, self.config['mapping']['sample'])
             
             indice_h, indice_w = indice % (self.dataset.H), indice // (self.dataset.H)
@@ -230,17 +243,21 @@ class CoSLAM():
             target_s = batch['rgb'].squeeze(0)[indice_h, indice_w, :].to(self.device)
             target_d = batch['depth'].squeeze(0)[indice_h, indice_w].to(self.device).unsqueeze(-1)
 
+            # ********************* 根据位姿估计计算射线的原点和方向 *********************
             rays_o = c2w[None, :3, -1].repeat(self.config['mapping']['sample'], 1)
             rays_d = torch.sum(rays_d_cam[..., None, :] * c2w[:3, :3], -1)
 
             # Forward
+            # ********************* 前向传播: 得到rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 *********************
             ret = self.model.forward(rays_o, rays_d, target_s, target_d)
             loss = self.get_loss_from_ret(ret)
+
+            # ********************* 反响传播: 优化encoder/decoder网络的参数 *********************
             loss.backward()
             self.cur_map_optimizer.step()
         
         
-        return ret, loss
+        return ret, loss    # 返回: rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 
 
     def smoothness(self, sample_points=256, voxel_size=0.1, margin=0.05, color=False):
         '''
@@ -289,88 +306,97 @@ class CoSLAM():
         '''
         pose_optimizer = None
 
-        # all the KF poses: 0, 5, 10, ...
+        # all the KF poses: 0, 5, 10, ... 读取当前所有关键帧的位姿
         poses = torch.stack([self.est_c2w_data[i] for i in range(0, cur_frame_id, self.config['mapping']['keyframe_every'])])
         
-        # frame ids for all KFs, used for update poses after optimization
+        # frame ids for all KFs, used for update poses after optimization 所有关键帧的id
         frame_ids_all = torch.tensor(list(range(0, cur_frame_id, self.config['mapping']['keyframe_every'])))
 
+        # ********************* 整合要参与全局BA的位姿: poses_all *********************
+        # 前10帧,不优化位姿,即不设置pose_optimizer
         if len(self.keyframeDatabase.frame_ids) < 2:
-            poses_fixed = torch.nn.parameter.Parameter(poses).to(self.device)
-            current_pose = self.est_c2w_data[cur_frame_id][None,...]
+            poses_fixed = torch.nn.parameter.Parameter(poses).to(self.device)        # 把关键帧的位姿加入网络的可学习参数, 但关键帧的位姿不会被优化是固定的
+            current_pose = self.est_c2w_data[cur_frame_id][None,...]                 # 当前帧的位姿估计
             poses_all = torch.cat([poses_fixed, current_pose], dim=0)
-        
-        else:
-            poses_fixed = torch.nn.parameter.Parameter(poses[:1]).to(self.device)
-            current_pose = self.est_c2w_data[cur_frame_id][None,...]
 
-            if self.config['mapping']['optim_cur']:
-                cur_rot, cur_trans, pose_optimizer, = self.get_pose_param_optim(torch.cat([poses[1:], current_pose]))
-                pose_optim = self.matrix_from_tensor(cur_rot, cur_trans).to(self.device)
+        # 10帧之后,位姿参与优化,即设置pose_optimizer
+        else:
+            poses_fixed = torch.nn.parameter.Parameter(poses[:1]).to(self.device)    # 把关键帧的位姿加入网络的可学习参数, 但关键帧的位姿不会被优化是固定的
+            current_pose = self.est_c2w_data[cur_frame_id][None,...]                 # 当前帧的位姿估计
+
+            if self.config['mapping']['optim_cur']:    # 是否优化关键帧的同时也优化当前帧
+                cur_rot, cur_trans, pose_optimizer, = self.get_pose_param_optim(torch.cat([poses[1:], current_pose]))    # 得到关键帧和当前帧位姿的轴角,位移.并为他们创建了Adam优化器
+                pose_optim = self.matrix_from_tensor(cur_rot, cur_trans).to(self.device)                                 # 将轴角和位移转为 变换矩阵T
                 poses_all = torch.cat([poses_fixed, pose_optim], dim=0)
 
             else:
-                cur_rot, cur_trans, pose_optimizer, = self.get_pose_param_optim(poses[1:])
+                cur_rot, cur_trans, pose_optimizer, = self.get_pose_param_optim(poses[1:])                                # 相比于上面,就是没把当前帧的位姿参数也纳入优化范围
                 pose_optim = self.matrix_from_tensor(cur_rot, cur_trans).to(self.device)
                 poses_all = torch.cat([poses_fixed, pose_optim, current_pose], dim=0)
         
+        # ********************* 优化器梯度设置为0 *********************
         # Set up optimizer
-        self.map_optimizer.zero_grad()
+        self.map_optimizer.zero_grad()            # BA中: 用于优化encoder/decoder的 adam优化器
         if pose_optimizer is not None:
-            pose_optimizer.zero_grad()
+            pose_optimizer.zero_grad()            # BA中: 用于优化位姿的 adam优化器
         
-        current_rays = torch.cat([batch['direction'], batch['rgb'], batch['depth'][..., None]], dim=-1)
-        current_rays = current_rays.reshape(-1, current_rays.shape[-1])
+        current_rays = torch.cat([batch['direction'], batch['rgb'], batch['depth'][..., None]], dim=-1)    # 把三个观测信息整合起来    [1, 368, 496, 7]
+        current_rays = current_rays.reshape(-1, current_rays.shape[-1])                                    # 把每一帧的像素排列称一列  [182528, 7]
 
         
 
-        for i in range(self.config['mapping']['iters']):
+        for i in range(self.config['mapping']['iters']):            # iters=20
 
-            # Sample rays with real frame ids
-            # rays [bs, 7]
-            # frame_ids [bs]
-            rays, ids = self.keyframeDatabase.sample_global_rays(self.config['mapping']['sample'])
+            # 从保存的keyframeDatabase中提取射线
+            # rays [bs, 7] : 包含direction + rgb + depth 信息 [2048,7]
+            # frame_ids [bs] : 每一根射线的id [2048]
+            rays, ids = self.keyframeDatabase.sample_global_rays(self.config['mapping']['sample'])        # sample:2048
 
             #TODO: Checkpoint...
+            # 取样个数: 取sample:2048 // 当前库中的关键帧数frame_ids 和 min_pixels_cur: 100 取大值 
+            # 从当前帧中随机取上面这个数的射线, 一开始是2048根
             idx_cur = random.sample(range(0, self.dataset.H * self.dataset.W),max(self.config['mapping']['sample'] // len(self.keyframeDatabase.frame_ids), self.config['mapping']['min_pixels_cur']))
-            current_rays_batch = current_rays[idx_cur, :]
+            current_rays_batch = current_rays[idx_cur, :]    # 从当前帧中随机取样的射线
 
-            rays = torch.cat([rays, current_rays_batch], dim=0) # N, 7
-            ids_all = torch.cat([ids//self.config['mapping']['keyframe_every'], -torch.ones((len(idx_cur)))]).to(torch.int64)
+            rays = torch.cat([rays, current_rays_batch], dim=0)          # 特征库中取样的射线+当前帧取样的射线   [4096,7]
+            ids_all = torch.cat([ids//self.config['mapping']['keyframe_every'], -torch.ones((len(idx_cur)))]).to(torch.int64)        # 特征库中取样的射线+当前帧取样的射线的索引 [4096]
 
 
-            rays_d_cam = rays[..., :3].to(self.device)
-            target_s = rays[..., 3:6].to(self.device)
-            target_d = rays[..., 6:7].to(self.device)
+            rays_d_cam = rays[..., :3].to(self.device)    # 相机坐标系下的射线方向    [4096, 3]
+            target_s = rays[..., 3:6].to(self.device)     # 相机坐标系下的颜色预测值  [4096, 3]
+            target_d = rays[..., 6:7].to(self.device)     # 相机坐标系下的深度预测值  [4096, 1]
 
             # [N, Bs, 1, 3] * [N, 1, 3, 3] = (N, Bs, 3)
-            rays_d = torch.sum(rays_d_cam[..., None, None, :] * poses_all[ids_all, None, :3, :3], -1)
-            rays_o = poses_all[ids_all, None, :3, -1].repeat(1, rays_d.shape[1], 1).reshape(-1, 3)
+            rays_d = torch.sum(rays_d_cam[..., None, None, :] * poses_all[ids_all, None, :3, :3], -1)    # 世界坐标系下的射线方向 = 相机坐标系下的射线方向 ✖ 位姿估计 [4096, 1, 3]
+            rays_o = poses_all[ids_all, None, :3, -1].repeat(1, rays_d.shape[1], 1).reshape(-1, 3)       # 位姿估计的t           [4096, 3]
             rays_d = rays_d.reshape(-1, 3)
 
-
+            # ********************* 前向传播: 得到rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失 *********************
             ret = self.model.forward(rays_o, rays_d, target_s, target_d)
 
+            # ********************* 反响传播 *********************
             loss = self.get_loss_from_ret(ret, smooth=True)
             
             loss.backward(retain_graph=True)
-            
+
+            # ********************* 更新encoder和decoder网络的参数 *********************
             if (i + 1) % cfg["mapping"]["map_accum_step"] == 0:
                
                 if (i + 1) > cfg["mapping"]["map_wait_step"]:
-                    self.map_optimizer.step()
+                    self.map_optimizer.step()            # 更新参数
                 else:
                     print('Wait update')
                 self.map_optimizer.zero_grad()
 
-            if pose_optimizer is not None and (i + 1) % cfg["mapping"]["pose_accum_step"] == 0:
-                pose_optimizer.step()
+            # ********************* 更新位姿的参数 *********************
+            if pose_optimizer is not None and (i + 1) % cfg["mapping"]["pose_accum_step"] == 0:        # 每pose_accum_step=5次优化map后,优化一次位姿参数
+                pose_optimizer.step()                                                                  # 更新参数
                 # get SE3 poses to do forward pass
-                pose_optim = self.matrix_from_tensor(cur_rot, cur_trans)
+                pose_optim = self.matrix_from_tensor(cur_rot, cur_trans)                               # 不优化关键帧,只优化普通帧的位姿
                 pose_optim = pose_optim.to(self.device)
                 # So current pose is always unchanged
                 if self.config['mapping']['optim_cur']:
-                    poses_all = torch.cat([poses_fixed, pose_optim], dim=0)
+                    poses_all = torch.cat([poses_fixed, pose_optim], dim=0)                            # [n, 4, 4] 前n-1帧是关键帧,是固定的不会再优化了
                 
                 else:
                     current_pose = self.est_c2w_data[cur_frame_id][None,...]
@@ -381,13 +407,15 @@ class CoSLAM():
 
                 # zero_grad here
                 pose_optimizer.zero_grad()
-        
+
+        # 上面优化完后运行:
+        # 如果需要优化位姿,并且当前关键帧库里关键帧的个数>1
         if pose_optimizer is not None and len(frame_ids_all) > 1:
-            for i in range(len(frame_ids_all[1:])):
+            for i in range(len(frame_ids_all[1:])):                # 去掉第0帧,更新每一个关键帧为全局优化完的位姿
                 self.est_c2w_data[int(frame_ids_all[i+1].item())] = self.matrix_from_tensor(cur_rot[i:i+1], cur_trans[i:i+1]).detach().clone()[0]
         
             if self.config['mapping']['optim_cur']:
-                print('Update current pose')
+                print('Update current pose')                        # 更新当前帧的位姿为全局优化完的位姿
                 self.est_c2w_data[cur_frame_id] = self.matrix_from_tensor(cur_rot[-1:], cur_trans[-1:]).detach().clone()[0]
  
     def predict_current_pose(self, frame_id, constant_speed=True):
@@ -506,12 +534,16 @@ class CoSLAM():
 
         c2w_gt = batch['c2w'][0].to(self.device)
 
+        # ********************* 初始化当前帧的位姿估计 *********************
         # Initialize current pose
-        if self.config['tracking']['iter_point'] > 0:
+        if self.config['tracking']['iter_point'] > 0:    # 通过点云损失来跟踪当前帧的相机位姿时使用，本论文没用该方法
             cur_c2w = self.est_c2w_data[frame_id]
         else:
+            # 使用论文的方法来跟踪相机位姿时使用
+            # ! -------------------- 2.2 Camera tracking: 初始化位姿估计 --------------------
             cur_c2w = self.predict_current_pose(frame_id, self.config['tracking']['const_speed'])
 
+        # ********************* 一些训练变量 *********************
         indice = None
         best_sdf_loss = None
         thresh=0
@@ -519,49 +551,67 @@ class CoSLAM():
         iW = self.config['tracking']['ignore_edge_W']
         iH = self.config['tracking']['ignore_edge_H']
 
+        # ********************* 为位姿估计设置优化器 *********************
+        # 提取当前位姿的t,R。并给他们创建Adam优化器
+        # cur_rot: [1,3] 转为轴角表示
+        # cur_trans: [1,3] 位移
         cur_rot, cur_trans, pose_optimizer = self.get_pose_param_optim(cur_c2w[None,...], mapping=False)
 
+        # ! -------------------- 2.2 Camera tracking: 优化位姿 -------------------- 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # ********************* 开始跟踪 *********************
         # Start tracking
         for i in range(self.config['tracking']['iter']):
-            pose_optimizer.zero_grad()
+            pose_optimizer.zero_grad()                                # 将R和t的adam优化器梯度设置为0
+            
+            # ********************* 将位姿估计：cur_rot, cur_trans转为变换矩阵 *********************
             c2w_est = self.matrix_from_tensor(cur_rot, cur_trans)
 
+            # ********************* 从当前帧中采样像素点,并从数据中读取这些像素点的观测值 *********************
             # Note here we fix the sampled points for optimisation
             if indice is None:
+                # 从一个范围内的整数（0 到 H * W - 1）中随机选择samples=1024个图片像素点索引
                 indice = self.select_samples(self.dataset.H-iH*2, self.dataset.W-iW*2, self.config['tracking']['sample'])
             
                 # Slicing
-                indice_h, indice_w = indice % (self.dataset.H - iH * 2), indice // (self.dataset.H - iH * 2)
-                rays_d_cam = batch['direction'].squeeze(0)[iH:-iH, iW:-iW, :][indice_h, indice_w, :].to(self.device)
-            target_s = batch['rgb'].squeeze(0)[iH:-iH, iW:-iW, :][indice_h, indice_w, :].to(self.device)
-            target_d = batch['depth'].squeeze(0)[iH:-iH, iW:-iW][indice_h, indice_w].to(self.device).unsqueeze(-1)
+                indice_h, indice_w = indice % (self.dataset.H - iH * 2), indice // (self.dataset.H - iH * 2)            # 将取样点的像素坐标(高和宽)提取出来
+                rays_d_cam = batch['direction'].squeeze(0)[iH:-iH, iW:-iW, :][indice_h, indice_w, :].to(self.device)    # 相机坐标下各个采样点的射线方向 [1024, 3]
+            target_s = batch['rgb'].squeeze(0)[iH:-iH, iW:-iW, :][indice_h, indice_w, :].to(self.device)                # 相机坐标下各个采样点的rgb观测值[1024, 3]
+            target_d = batch['depth'].squeeze(0)[iH:-iH, iW:-iW][indice_h, indice_w].to(self.device).unsqueeze(-1)      # 相机坐标下各个采样点的深度观测值 [1024, 1]
 
-            rays_o = c2w_est[...,:3, -1].repeat(self.config['tracking']['sample'], 1)
-            rays_d = torch.sum(rays_d_cam[..., None, :] * c2w_est[:, :3, :3], -1)
+            # ********************* 根据位姿估计计算射线起点和方向 *********************
+            rays_o = c2w_est[...,:3, -1].repeat(self.config['tracking']['sample'], 1)    # 射线的原点：即估计位姿T中提取的位移t
+            rays_d = torch.sum(rays_d_cam[..., None, :] * c2w_est[:, :3, :3], -1)        # 射线的方向：相机坐标下的射线方向 ✖ 位姿估计C2W 转为世界坐标系下的射线方向
 
-            ret = self.model.forward(rays_o, rays_d, target_s, target_d)
-            loss = self.get_loss_from_ret(ret)
-            
-            if best_sdf_loss is None:
-                best_sdf_loss = loss.cpu().item()
-                best_c2w_est = c2w_est.detach()
+            # ********************* 使用encoder/decoder网络，根据观测值和估计值计算损失函数 *********************
+            ret = self.model.forward(rays_o, rays_d, target_s, target_d)    # 得到rgb图，深度图，rgb损失，深度损失,sdf损失，fs损失
+            loss = self.get_loss_from_ret(ret)                              # 所有的loss之和
 
-            with torch.no_grad():
-                c2w_est = self.matrix_from_tensor(cur_rot, cur_trans)
+            # ********************* 判断sdf损失有无变小,并找到最佳loss下的位姿估计 *********************
+            if best_sdf_loss is None:                # 初始化best_sdf_loss
+                best_sdf_loss = loss.cpu().item()    # 将loss的数据结构之和从tensor转为double
+                best_c2w_est = c2w_est.detach()      # 创建张量c2w_est的无梯度副本
 
-                if loss.cpu().item() < best_sdf_loss:
-                    best_sdf_loss = loss.cpu().item()
-                    best_c2w_est = c2w_est.detach()
+            with torch.no_grad():    # 下面代码块：禁用梯度计算
+                c2w_est = self.matrix_from_tensor(cur_rot, cur_trans)       # 将轴角cur_rot 和 位移cur_trans 转为 变换矩阵
+
+                if loss.cpu().item() < best_sdf_loss:                       # 如果损失相比之前变小了，就更新最好的sdf损失
+                    best_sdf_loss = loss.cpu().item()                       # 更新最好的sdf损失
+                    best_c2w_est = c2w_est.detach()                         # 创建张量c2w_est的无梯度副本,保存最佳loss下的位姿估计
                     thresh = 0
                 else:
-                    thresh +=1
+                    thresh +=1                                              # 如果优化后损失没比以前变小，thresh+1
             
             if thresh >self.config['tracking']['wait_iters']:
                 break
 
-            loss.backward()
-            pose_optimizer.step()
-        
+            # ********************* 更新参数 *********************
+            loss.backward()                # 反响传播，计算相对于 cur_trans 和 cur_rot 的梯度
+            pose_optimizer.step()          # 更新参数
+        # ********************* 结束跟踪 *********************
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+        # ********************* 使用loss最小的位姿估计作为当前帧的位姿估计 *********************
         if self.config['tracking']['best']:
             # Use the pose with smallest loss
             self.est_c2w_data[frame_id] = best_c2w_est.detach().clone()[0]
@@ -569,13 +619,14 @@ class CoSLAM():
             # Use the pose after the last iteration
             self.est_c2w_data[frame_id] = c2w_est.detach().clone()[0]
 
-       # Save relative pose of non-keyframes
-        if frame_id % self.config['mapping']['keyframe_every'] != 0:
-            kf_id = frame_id // self.config['mapping']['keyframe_every']
-            kf_frame_id = kf_id * self.config['mapping']['keyframe_every']
-            c2w_key = self.est_c2w_data[kf_frame_id]
-            delta = self.est_c2w_data[frame_id] @ c2w_key.float().inverse()
-            self.est_c2w_data_rel[frame_id] = delta
+        # ! -------------------- 2.3 Tracked frame -------------------- 
+        # Save relative pose of non-keyframes
+        if frame_id % self.config['mapping']['keyframe_every'] != 0:            # 如果不是关键帧
+            kf_id = frame_id // self.config['mapping']['keyframe_every']        # 当前帧所属的关键帧的索引，比如11//5=2 第11帧属于第2个的关键帧
+            kf_frame_id = kf_id * self.config['mapping']['keyframe_every']      # 关键帧id，比如2*5，第2个关键帧就是第10帧
+            c2w_key = self.est_c2w_data[kf_frame_id]                            # 关键帧的估计位姿
+            delta = self.est_c2w_data[frame_id] @ c2w_key.float().inverse()     # 当前帧的T 乘上 关键帧的T^-1 得到两帧位姿之间的差异
+            self.est_c2w_data_rel[frame_id] = delta                             # 保存差异
         
         print('Best loss: {}, Last loss{}'.format(F.l1_loss(best_c2w_est.to(self.device)[0,:3], c2w_gt[:3]).cpu().item(), F.l1_loss(c2w_est[0,:3], c2w_gt[:3]).cpu().item()))
     
