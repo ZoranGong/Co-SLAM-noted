@@ -9,10 +9,10 @@ class ColorNet(nn.Module):
                 hidden_dim_color=64, num_layers_color=3):
         super(ColorNet, self).__init__()
         self.config = config
-        self.input_ch = input_ch
-        self.geo_feat_dim = geo_feat_dim
-        self.hidden_dim_color = hidden_dim_color
-        self.num_layers_color = num_layers_color
+        self.input_ch = input_ch                        # 48
+        self.geo_feat_dim = geo_feat_dim                # 15 几何特征维度
+        self.hidden_dim_color = hidden_dim_color        # 32
+        self.num_layers_color = num_layers_color        # 2
 
         self.model = self.get_model(config['decoder']['tcnn_network'])
     
@@ -39,14 +39,14 @@ class ColorNet(nn.Module):
         color_net =  []
         for l in range(self.num_layers_color):
             if l == 0:
-                in_dim = self.input_ch + self.geo_feat_dim
+                in_dim = self.input_ch + self.geo_feat_dim                # 63
             else:
                 in_dim = self.hidden_dim_color
             
             if l == self.num_layers_color - 1:
-                out_dim = 3 # 3 rgb
+                out_dim = 3 # 3 rgb                                        # 第二层 3 rgb
             else:
-                out_dim = self.hidden_dim_color
+                out_dim = self.hidden_dim_color                            # 第一层 32
             
             color_net.append(nn.Linear(in_dim, out_dim, bias=False))
             if l != self.num_layers_color - 1:
@@ -97,9 +97,9 @@ class SDFNet(nn.Module):
                     in_dim = self.hidden_dim 
                 
                 if l == self.num_layers - 1:
-                    out_dim = 1 + self.geo_feat_dim # 1 sigma + 15 SH features for color
+                    out_dim = 1 + self.geo_feat_dim # 1 sigma + 15 SH features for color            # 第二层： 16     1 sigma + 15 SH features for color
                 else:
-                    out_dim = self.hidden_dim 
+                    out_dim = self.hidden_dim                                                       # 第一层： 32
                 
                 sdf_net.append(nn.Linear(in_dim, out_dim, bias=False))
                 if l != self.num_layers - 1:
